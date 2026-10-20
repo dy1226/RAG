@@ -1,0 +1,91 @@
+/* ============================================================
+   全局基础样式 / 设计变量 —— 极简科技风（冷色系 + 电光蓝高亮）
+   ============================================================ */
+:root {
+  /* 冷色系灰阶：深灰 → 浅灰 */
+  --ink-900: #0f172e; /* 标题 / 强调（深蓝黑） */
+  --ink-700: #364156; /* 正文（深灰蓝） */
+  --ink-500: #687488; /* 次要文字（灰蓝） */
+  --ink-400: #94a3b8; /* 提示文字（浅灰蓝） */
+
+  /* 结构 */
+  --line: #cbd5e1;
+  --line-soft: #e8eef5;
+  --surface: #f8fafc;
+  --surface-sunken: #eef2f7;
+
+  /* 电光蓝高亮 + 危险红 */
+  --accent: #0ea5e9; /* 电光蓝 */
+  --danger: #ef4444;
+
+  --radius-lg: 8px;
+  --radius-md: 6px;
+
+  --shadow-sm: 0 1px 3px rgba(15, 23, 46, 0.06);
+  --shadow-md: 0 4px 12px rgba(15, 23, 46, 0.1);
+
+  --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC',
+    'Hiragino Sans GB', 'Microsoft YaHei', 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, 'JetBrains Mono', Consolas,
+    'Liberation Mono', Menlo, monospace;
+
+  color-scheme: light;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--ink-700);
+  background-color: var(--surface-sunken);
+  /* 极淡的网格底纹，营造科技感 */
+  background-image:
+    linear-gradient(rgba(15, 23, 46, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(15, 23, 46, 0.035) 1px, transparent 1px);
+  background-size: 32px 32px;
+  background-attachment: fixed;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
+#root {
+  display: block;
+  width: 100%;
+  text-align: left;
+}
+
+::selection {
+  background: rgba(14, 165, 233, 0.22);
+  color: var(--ink-900);
+}
+
+/* 细滚动条 */
+::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(15, 23, 46, 0.2);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(14, 165, 233, 0.55);
+  background-clip: content-box;
+}

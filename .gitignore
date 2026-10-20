@@ -1,0 +1,42 @@
+# Python 虚拟环境与缓存
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# 前端依赖与构建产物
+frontend/node_modules/
+frontend/dist/
+
+# 本地数据文件
+uploads/
+chroma_db/
+data/
+chat_memory.sqlite3
+chat_memory.sqlite3-shm
+chat_memory.sqlite3-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.csv
+*.xlsx
+*.pdf
+*.docx
+*.txt
+!requirements.txt
+
+# 配置与编辑器
+.env
+*.log
+.idea/
+.vscode/
+
+# 本地模型缓存（约 86MB，不入库）
+models/
+
+# pip 在沙箱里留下的临时目录
+pip-*
