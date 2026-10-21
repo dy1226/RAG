@@ -15,6 +15,22 @@ const { TextArea } = Input
 // 与数据分析页共用同一个后端
 const API = import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000'
 
+// 匿名用户标识：首次访问时生成并存入 localStorage，长期记忆靠它跨会话关联同一个用户。
+// 清除浏览器数据或更换浏览器后会变成新用户。
+const USER_ID_KEY = 'qa_user_id'
+function getUserId() {
+  try {
+    let id = localStorage.getItem(USER_ID_KEY)
+    if (!id) {
+      id = globalThis.crypto?.randomUUID?.() || `u-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+      localStorage.setItem(USER_ID_KEY, id)
+    }
+    return id
+  } catch {
+    return 'default'   // localStorage 不可用（隐私模式等）时退回默认用户
+  }
+}
+
 export default function RagPanel() {
   const [doc, setDoc] = useState(null)            // { filename, chunks }
   const [uploading, setUploading] = useState(false)
@@ -22,6 +38,7 @@ export default function RagPanel() {
   const [asking, setAsking] = useState(false)
   const [messages, setMessages] = useState([])    // { role, content, docs }
   const [sessionId, setSessionId] = useState(() => `s-${Date.now()}`)
+  const [userId] = useState(getUserId)
   const [documents, setDocuments] = useState([]) // 知识库已有文档 [{ source, chunks }]
   const [scope, setScope] = useState('all')      // 检索范围：'all' 或某个文档名
   const listRef = useRef(null)
@@ -87,6 +104,7 @@ export default function RagPanel() {
       const res = await axios.post(`${API}/rag/chat`, {
         question: q,
         session_id: sessionId,
+        user_id: userId,
         source: scope === 'all' ? null : scope,
       })
       if (res.data?.success === false) {
@@ -113,6 +131,10 @@ export default function RagPanel() {
 
   // 开启新对话：清空消息 + 换一个 session_id（验证会话隔离）
   const handleNewChat = () => {
+    // 通知后端把刚结束的会话写入长期记忆（后台执行，失败不影响开启新对话）
+    if (messages.length > 0) {
+      axios.post(`${API}/memory/session/close`, { session_id: sessionId, user_id: userId }).catch(() => {})
+    }
     setMessages([])
     setSessionId(`s-${Date.now()}`)
     message.success('已开启新对话')

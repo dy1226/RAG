@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import chardet
 import hashlib
@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import time
 import observability
+from memory import MemoryStore
 from pypdf import PdfReader
 from docx import Document as DocxDocument
 from pydantic import BaseModel
@@ -18,6 +19,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import ChatOpenAI
 from langchain_core.tools import tool
 from langchain.agents import create_agent
+from langchain.agents.middleware import wrap_model_call
+from langchain_core.messages import trim_messages
 from langchain_chroma import Chroma             
 from langchain_core.embeddings import Embeddings
 from langchain_core.documents import Document
@@ -213,6 +216,68 @@ try:
 except Exception:
     # 持久化不可用时退回内存记忆，保证服务仍能启动
     _rag_checkpointer = InMemorySaver()
+
+
+# ==================== 长期记忆（情境记忆 + 语义记忆） ====================
+# 短期记忆 = 上面的 checkpointer（当前会话的对话）；
+# 长期记忆放在独立的 SQLite 文件里，摘要向量放在 Chroma 的 episodic_memory 集合。
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "1") != "0"
+MEMORY_DB_PATH = os.getenv("MEMORY_DB_PATH") or os.path.join(BASE_DIR, "memory.sqlite3")
+MEMORY_TOP_K = int(os.getenv("MEMORY_TOP_K", "3"))
+MEMORY_SUMMARY_EVERY_N_TURNS = int(os.getenv("MEMORY_SUMMARY_EVERY_N_TURNS", "6"))
+# 短期记忆里最多送给模型的最近消息条数（只影响送模型的内容，不删除已存的对话）
+SHORT_TERM_MAX_MESSAGES = int(os.getenv("SHORT_TERM_MAX_MESSAGES", "20"))
+
+
+def _memory_llm(prompt, label):
+    """记忆摘要/偏好抽取：用轻量模型、关闭思考链，调用自动计入 /metrics"""
+    return call_ai(prompt, label=label, no_thinking=True, model=RERANK_MODEL)
+
+
+def _memory_error(label, message):
+    observability.record_llm_call(label, 0, ok=False, error=message)
+
+
+def _build_episodic_vectorstore():
+    """情境记忆的向量库；知识库被禁用（CI）或初始化失败时返回 None，记忆退化为按时间取最近几条"""
+    if os.getenv("KB_DISABLED") == "1":
+        return None
+    try:
+        return Chroma(
+            collection_name="episodic_memory",
+            embedding_function=ChromaONNXEmbeddings(),
+            persist_directory=CHROMA_PATH,
+        )
+    except Exception:
+        return None
+
+
+try:
+    memory_store = MemoryStore(
+        MEMORY_DB_PATH, _memory_llm,
+        vectorstore=_build_episodic_vectorstore() if MEMORY_ENABLED else None,
+        enabled=MEMORY_ENABLED,
+        top_k=MEMORY_TOP_K,
+        summary_every_n_turns=MEMORY_SUMMARY_EVERY_N_TURNS,
+        on_error=_memory_error,
+    )
+except Exception:
+    # 记忆库打不开时整体关闭长期记忆，不能拖垮问答主流程
+    memory_store = None
+
+
+@wrap_model_call
+def _trim_short_term(request, handler):
+    """只把最近 N 条消息送给模型；从用户消息开始截取，避免把工具调用与其结果拆开"""
+    msgs = request.messages
+    if SHORT_TERM_MAX_MESSAGES > 0 and len(msgs) > SHORT_TERM_MAX_MESSAGES:
+        trimmed = trim_messages(
+            msgs, strategy="last", max_tokens=SHORT_TERM_MAX_MESSAGES,
+            token_counter=len, start_on="human", include_system=False,
+        )
+        if trimmed:
+            request = request.override(messages=trimmed)
+    return handler(request)
 
 
 def kb_unavailable():
@@ -436,6 +501,36 @@ class RagChatRequest(BaseModel):
     source: str | None = None
     # 是否启用 LLM 重排：精度更高，但每次多一次模型调用
     use_rerank: bool = True
+    # 匿名用户标识（前端 localStorage 生成），长期记忆按它隔离
+    user_id: str = "default"
+
+
+def _clean_id(value, limit=64):
+    return (value or "default").strip()[:limit] or "default"
+
+
+def _session_messages(session_id):
+    """从短期记忆（checkpointer）取出该会话的用户/助手对话，供摘要与偏好抽取使用"""
+    tup = _rag_checkpointer.get_tuple({"configurable": {"thread_id": session_id}})
+    if tup is None:
+        return []
+    out = []
+    for m in tup.checkpoint.get("channel_values", {}).get("messages", []):
+        role = {"human": "user", "ai": "assistant"}.get(getattr(m, "type", ""))
+        content = m.content if isinstance(m.content, str) else ""
+        if role and content.strip():     # 跳过只含工具调用、没有正文的 AI 消息
+            out.append({"role": role, "content": content})
+    return out
+
+
+def _run_memory_job(user_id, session_id, force=False):
+    """后台任务：更新会话摘要与用户偏好。任何异常都不会影响聊天"""
+    if memory_store is None:
+        return
+    try:
+        memory_store.process_session(user_id, session_id, _session_messages(session_id), force=force)
+    except Exception as e:
+        _memory_error("memory-job", str(e)[:120])
 
 
 _rag_system_prompt = (
@@ -455,7 +550,7 @@ _rag_system_prompt = (
 
 
 @app.post("/rag/chat")
-def rag_chat(req: RagChatRequest):
+def rag_chat(req: RagChatRequest, background_tasks: BackgroundTasks):
     if vectorstore is None:
         return kb_unavailable()
     try:
@@ -467,11 +562,17 @@ def rag_chat(req: RagChatRequest):
         collected = {"docs": []}
         search_tool = build_retriever_tool(collected, source=req.source, use_rerank=req.use_rerank)
 
+        # 长期记忆：用户偏好 + 相关历史会话摘要，拼在基础提示词后面（读取失败返回空串）
+        user_id = _clean_id(req.user_id)
+        memory_prompt = (memory_store.build_prompt(user_id, req.question, session_id=req.session_id)
+                         if memory_store else "")
+
         agent = create_agent(
             model=get_llm(),
             tools=[search_tool, build_list_documents_tool()],
             checkpointer=_rag_checkpointer,
-            system_prompt=_rag_system_prompt,
+            system_prompt=_rag_system_prompt + memory_prompt,
+            middleware=[_trim_short_term],
         )
 
         # LangGraph 1.2+ 的 invoke 方法不接受 callbacks，改为直接在 agent 的 with_config 中设置
@@ -481,6 +582,10 @@ def rag_chat(req: RagChatRequest):
         ).invoke(
             {"messages": [{"role": "user", "content": req.question}]}
         )
+
+        # 响应返回后再在后台更新长期记忆（累计满 N 轮才会真正调用模型）
+        if memory_store is not None and memory_store.enabled:
+            background_tasks.add_task(_run_memory_job, user_id, req.session_id)
 
         return {
             "success": True,
@@ -498,3 +603,60 @@ def rag_chat(req: RagChatRequest):
 def get_metrics():
     """大模型调用指标：次数 / token / 延迟（均值、P95）/ 估算成本"""
     return observability.snapshot()
+
+
+# ==================== 长期记忆管理接口 ====================
+# 注意：这些接口与 /rag/chat 一样没有身份认证，user_id 只是前端生成的匿名标识，
+# 任何知道它的人都能读写对应记忆。需要多用户隔离的正式部署请在此之前加登录鉴权。
+class MemoryCloseRequest(BaseModel):
+    session_id: str
+    user_id: str = "default"
+
+
+def _memory_unavailable():
+    return {"success": False, "error": "长期记忆未启用或初始化失败"}
+
+
+@app.post("/memory/session/close")
+def memory_session_close(req: MemoryCloseRequest, background_tasks: BackgroundTasks):
+    """会话结束（如点击“新对话”）时调用：把尚未总结的轮次也纳入摘要与偏好抽取"""
+    if memory_store is None or not memory_store.enabled:
+        return _memory_unavailable()
+    background_tasks.add_task(_run_memory_job, _clean_id(req.user_id), req.session_id, True)
+    return {"success": True}
+
+
+@app.get("/memory/{user_id}")
+def memory_get(user_id: str):
+    """查看某用户的全部长期记忆：用户偏好 + 历史会话摘要"""
+    if memory_store is None:
+        return _memory_unavailable()
+    uid = _clean_id(user_id)
+    return {
+        "success": True,
+        "enabled": memory_store.enabled,
+        "preferences": memory_store.list_preferences(uid),
+        "episodes": memory_store.list_episodes(uid),
+    }
+
+
+@app.delete("/memory/semantic/{pref_id}")
+def memory_delete_preference(pref_id: str, user_id: str = "default"):
+    if memory_store is None:
+        return _memory_unavailable()
+    return {"success": memory_store.delete_preference(_clean_id(user_id), pref_id)}
+
+
+@app.delete("/memory/episodic/{episode_id}")
+def memory_delete_episode(episode_id: str, user_id: str = "default"):
+    if memory_store is None:
+        return _memory_unavailable()
+    return {"success": memory_store.delete_episode(_clean_id(user_id), episode_id)}
+
+
+@app.delete("/memory/{user_id}")
+def memory_clear(user_id: str):
+    """清空某用户的全部长期记忆（不影响短期记忆里的对话记录）"""
+    if memory_store is None:
+        return _memory_unavailable()
+    return {"success": True, **memory_store.clear_user(_clean_id(user_id))}

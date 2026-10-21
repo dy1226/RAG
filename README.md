@@ -13,6 +13,10 @@
   - 第一阶段：向量相似度宽召回（top-10）
   - 第二阶段：LLM 重排过滤（top-3），确保高相关性
 - **多轮对话**：基于 LangGraph checkpointer，按 session_id 持久化上下文，支持追问
+- **长短期记忆**：
+  - 短期记忆：当前会话的对话（LangGraph SqliteSaver），每次只把最近 N 条消息送给模型
+  - 情境记忆：历史会话摘要，提问时按语义检索最相关的几条
+  - 语义记忆：从对话中总结的用户偏好（回答风格、格式等），每次提问都会带上
 - **检索限定**：可指定只在某一份文档内检索，避免多文档间干扰
 - **溯源展示**：每条回答附带检索到的原文片段，便于追踪信息来源
 - **模型可插拔**：支持火山方舟、DeepSeek、智谱等任意 OpenAI 兼容接口，只改 .env 不动代码
@@ -147,6 +151,25 @@ Content-Type: application/json
 }
 ```
 
+### 长期记忆
+
+`/rag/chat` 请求新增可选字段 `user_id`（前端用 localStorage 生成的匿名 UUID），长期记忆按它隔离。
+
+```bash
+GET    /memory/{user_id}                       # 查看偏好与历史会话摘要
+POST   /memory/session/close                   # 会话结束，补做一次摘要与偏好抽取
+       {"session_id": "...", "user_id": "..."}
+DELETE /memory/semantic/{id}?user_id=...       # 删除一条偏好
+DELETE /memory/episodic/{id}?user_id=...       # 删除一条会话摘要
+DELETE /memory/{user_id}                       # 清空该用户的全部长期记忆
+```
+
+说明：
+- 摘要与偏好抽取在响应返回后的后台任务里执行，每累计 `MEMORY_SUMMARY_EVERY_N_TURNS` 轮触发一次，点击“新对话”时再补一次。
+- 记忆只用于调整回答风格和理解上下文，知识库里的事实仍然必须检索后回答。
+- 这些接口没有身份认证，`user_id` 只是匿名标识，多用户正式部署前需要加登录鉴权。
+- 更换浏览器或清除浏览器数据后会成为新用户，原有记忆不会跟随。
+
 ### 监控指标
 
 **查询大模型调用指标**
@@ -207,6 +230,11 @@ llm-data-analyst-agent/
 | `LLM_DISABLE_THINKING_JSON` | - | 禁用思考链参数（各厂商字段不同） |
 | `CHAT_DB_PATH` | - | 对话记录数据库路径，默认 `chat_memory.sqlite3` |
 | `KB_DISABLED` | - | 设为 `1` 禁用知识库（CI 环境用） |
+| `MEMORY_ENABLED` | - | 设为 `0` 关闭长期记忆，默认开启 |
+| `MEMORY_DB_PATH` | - | 长期记忆数据库路径，默认 `memory.sqlite3` |
+| `MEMORY_TOP_K` | - | 每次回忆的历史会话摘要条数，默认 3 |
+| `MEMORY_SUMMARY_EVERY_N_TURNS` | - | 每累计几轮提问更新一次摘要与偏好，默认 6 |
+| `SHORT_TERM_MAX_MESSAGES` | - | 每次送给模型的最近消息条数，默认 20，0 表示不裁剪 |
 | `ALERT_LATENCY_MS` | - | 单次调用耗时告警阈值 |
 | `ALERT_FAIL_RATE` | - | 调用失败率告警阈值 |
 | `ALERT_TOKENS` | - | Token 预算告警阈值 |
